@@ -1661,6 +1661,48 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """Return a chat-scoped source shared by observed WhatsApp group turns."""
         return dataclasses.replace(source, user_id=None, user_name=None, user_id_alt=None)
 
+    def _whatsapp_share_observed_group_context(self) -> bool:
+        """Whether observed WhatsApp context is visible across approved groups."""
+        configured = self.config.extra.get("share_observed_group_context")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return (_wenv("WHATSAPP_SHARE_OBSERVED_GROUP_CONTEXT", "false") or "false").lower() in {
+            "true", "1", "yes", "on"
+        }
+
+    def _whatsapp_group_observe_context_source(self, source):
+        """Return the profile-scoped synthetic source for shared observations."""
+        return dataclasses.replace(
+            source,
+            chat_id="__hermes_whatsapp_observed_group_context__",
+            chat_name="WhatsApp observed group context",
+            user_id=None,
+            user_name=None,
+            user_id_alt=None,
+        )
+
+    def _whatsapp_shared_observed_context(self, source) -> str:
+        """Load recent passive group messages shared across WhatsApp groups."""
+        if not self._whatsapp_share_observed_group_context():
+            return ""
+        store = getattr(self, "_session_store", None)
+        if not store or not hasattr(store, "load_transcript"):
+            return ""
+        try:
+            entry = store.get_or_create_session(self._whatsapp_group_observe_context_source(source))
+            rows = store.load_transcript(entry.session_id) or []
+            observed = [
+                str(row.get("content", "")).strip()
+                for row in rows
+                if row.get("role") == "user" and row.get("observed") and row.get("content")
+            ]
+            return "\n".join(observed[-100:])
+        except Exception as exc:
+            logger.warning("[%s] Failed to load shared WhatsApp group context: %s", self.name, exc)
+            return ""
+
     @staticmethod
     def _whatsapp_group_observe_attributed_text(event: MessageEvent) -> str:
         user_id = event.source.user_id or "unknown"
@@ -1688,6 +1730,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if not data or not self._whatsapp_group_observe_enabled_for(data):
             return event
         prompt = self._whatsapp_group_observe_channel_prompt()
+        shared_context = self._whatsapp_shared_observed_context(event.source)
+        if shared_context:
+            prompt = (
+                f"{prompt}\n\n[Shared observed WhatsApp group context - context only]\n"
+                f"{shared_context}"
+            )
         channel_prompt = f"{event.channel_prompt}\\n\\n{prompt}" if event.channel_prompt else prompt
         return dataclasses.replace(
             event,
@@ -1722,6 +1770,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 entry["message_id"] = str(data["messageId"])
             session_entry = store.get_or_create_session(source)
             store.append_to_transcript(session_entry.session_id, entry)
+            if self._whatsapp_share_observed_group_context():
+                shared_entry = store.get_or_create_session(
+                    self._whatsapp_group_observe_context_source(source)
+                )
+                store.append_to_transcript(shared_entry.session_id, entry)
             logger.info(
                 "[%s] WhatsApp group message observed (no bot trigger): chat=%s from=%s",
                 self.name, source.chat_id, sender_id,
@@ -1935,6 +1988,8 @@ def _apply_yaml_config(yaml_cfg: dict, whatsapp_cfg: dict) -> dict | None:
         os.environ["WHATSAPP_MENTION_PATTERNS"] = _json.dumps(whatsapp_cfg["mention_patterns"])
     if "observe_unmentioned_group_messages" in whatsapp_cfg and not os.getenv("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"):
         os.environ["WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES"] = str(whatsapp_cfg["observe_unmentioned_group_messages"]).lower()
+    if "share_observed_group_context" in whatsapp_cfg and not os.getenv("WHATSAPP_SHARE_OBSERVED_GROUP_CONTEXT"):
+        os.environ["WHATSAPP_SHARE_OBSERVED_GROUP_CONTEXT"] = str(whatsapp_cfg["share_observed_group_context"]).lower()
     frc = whatsapp_cfg.get("free_response_chats")
     if frc is not None and not os.getenv("WHATSAPP_FREE_RESPONSE_CHATS"):
         if isinstance(frc, list):

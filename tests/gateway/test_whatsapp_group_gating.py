@@ -7,7 +7,8 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
                   dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
-                  observe_unmentioned_group_messages=None):
+                  observe_unmentioned_group_messages=None,
+                  share_observed_group_context=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -27,6 +28,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_allow_from"] = group_allow_from
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if share_observed_group_context is not None:
+        extra["share_observed_group_context"] = share_observed_group_context
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -56,6 +59,9 @@ class _FakeSessionStore:
 
     def append_to_transcript(self, session_id, message, skip_db=False):
         self.messages.append((session_id, message, skip_db))
+
+    def load_transcript(self, session_id):
+        return [message for stored_id, message, _ in self.messages if stored_id == session_id]
 
 
 def _group_message(body="hello", **overrides):
@@ -202,6 +208,35 @@ def test_mentioned_group_message_uses_observed_history_session():
     assert event.source.user_id is None
     assert event.text == "[Bob|60123456789@s.whatsapp.net]\\nwhat did we decide?"
     assert "observed WhatsApp group context" in event.channel_prompt
+
+
+def test_observed_group_context_can_be_shared_across_groups():
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="open",
+        observe_unmentioned_group_messages=True,
+        share_observed_group_context=True,
+    )
+    store = _FakeSessionStore()
+    adapter._session_store = store
+
+    asyncio.run(adapter._build_message_event(_group_message(
+        "The meeting is Friday",
+        chatId="group-a@g.us",
+        senderId="alice@s.whatsapp.net",
+        senderName="Alice",
+    )))
+    event = asyncio.run(adapter._build_message_event(_group_message(
+        "@15551230000 what was decided?",
+        chatId="group-b@g.us",
+        senderId="bob@s.whatsapp.net",
+        senderName="Bob",
+        mentionedIds=["15551230000@s.whatsapp.net"],
+    )))
+
+    assert event is not None
+    assert "The meeting is Friday" in event.channel_prompt
+    assert event.source.chat_id == "group-b@g.us"
 
 
 # --- New dm_policy tests ---
