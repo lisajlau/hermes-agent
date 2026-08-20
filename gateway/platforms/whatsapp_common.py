@@ -145,6 +145,23 @@ class WhatsAppBehaviorMixin:
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _whatsapp_observe_unmentioned_group_messages(self) -> bool:
+        """Return whether skipped group messages are retained as context.
+
+        This is deliberately opt-in.  With ``require_mention`` enabled it
+        lets a policy-approved group keep its conversation history without
+        causing Hermes to answer every message.
+        """
+        configured = self.config.extra.get("observe_unmentioned_group_messages")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return (
+            _get_wsecret("WHATSAPP_OBSERVE_UNMENTIONED_GROUP_MESSAGES", default="false")
+            or "false"
+        ).lower() in {"true", "1", "yes", "on"}
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config or env var."""
@@ -420,6 +437,23 @@ class WhatsAppBehaviorMixin:
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
+
+    def _should_observe_unmentioned_group_message(self, data: Dict[str, Any]) -> bool:
+        """Return True when a group message should be stored but not dispatched."""
+        if not self._whatsapp_observe_unmentioned_group_messages():
+            return False
+        if not data.get("isGroup", False):
+            return False
+        chat_id = str(data.get("chatId") or "")
+        if self._is_broadcast_chat(chat_id) or not self._is_group_allowed(chat_id):
+            return False
+        # Observation fills only the mention-gated gap; free-response groups
+        # and direct triggers continue through the normal agent path.
+        if chat_id in self._whatsapp_free_response_chats():
+            return False
+        if not self._whatsapp_require_mention():
+            return False
+        return not self._should_process_message(data)
 
     # ------------------------------------------------------------------ formatting
     def format_message(self, content: str) -> str:

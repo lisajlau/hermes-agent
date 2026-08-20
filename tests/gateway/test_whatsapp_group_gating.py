@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -5,7 +6,8 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,
-                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None):
+                  dm_policy=None, allow_from=None, group_policy=None, group_allow_from=None,
+                  observe_unmentioned_group_messages=None):
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
     extra = {}
@@ -23,6 +25,8 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
         extra["group_policy"] = group_policy
     if group_allow_from is not None:
         extra["group_allow_from"] = group_allow_from
+    if observe_unmentioned_group_messages is not None:
+        extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
 
     adapter = object.__new__(WhatsAppAdapter)
     adapter.platform = Platform.WHATSAPP
@@ -35,6 +39,23 @@ def _make_adapter(require_mention=None, mention_patterns=None, free_response_cha
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._free_response_chats = adapter._whatsapp_free_response_chats()
     return adapter
+
+
+class _FakeSessionEntry:
+    session_id = "whatsapp-group-session"
+
+
+class _FakeSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return _FakeSessionEntry()
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
 
 
 def _group_message(body="hello", **overrides):
@@ -137,6 +158,52 @@ def test_mention_stripping_removes_bot_phone_from_body():
     assert "weather" in cleaned
 
 
+def test_unmentioned_group_messages_are_observed_without_dispatch():
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="open",
+        observe_unmentioned_group_messages=True,
+    )
+    store = _FakeSessionStore()
+    adapter._session_store = store
+
+    result = asyncio.run(adapter._build_message_event(_group_message(
+        "Friday morning works for me",
+        senderId="60123456789@s.whatsapp.net",
+        senderName="Alice",
+        messageId="abc123",
+    )))
+
+    assert result is None
+    assert len(store.messages) == 1
+    session_id, message, skip_db = store.messages[0]
+    assert session_id == "whatsapp-group-session"
+    assert skip_db is False
+    assert message["content"] == "[Alice|60123456789@s.whatsapp.net]\\nFriday morning works for me"
+    assert message["observed"] is True
+    assert message["message_id"] == "abc123"
+    assert store.sources[0].user_id is None
+
+
+def test_mentioned_group_message_uses_observed_history_session():
+    adapter = _make_adapter(
+        require_mention=True,
+        group_policy="open",
+        observe_unmentioned_group_messages=True,
+    )
+    event = asyncio.run(adapter._build_message_event(_group_message(
+        "@15551230000 what did we decide?",
+        senderId="60123456789@s.whatsapp.net",
+        senderName="Bob",
+        mentionedIds=["15551230000@s.whatsapp.net"],
+    )))
+
+    assert event is not None
+    assert event.source.user_id is None
+    assert event.text == "[Bob|60123456789@s.whatsapp.net]\\nwhat did we decide?"
+    assert "observed WhatsApp group context" in event.channel_prompt
+
+
 # --- New dm_policy tests ---
 
 
@@ -228,5 +295,3 @@ def test_broadcast_filter_runs_before_allowlist():
         senderId="34612345678@s.whatsapp.net",
     )
     assert adapter._should_process_message(msg) is False
-
-
